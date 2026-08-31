@@ -1,0 +1,40 @@
+name: Python compatibility corpus
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install PyICU build dependency
+        run: sudo apt-get update && sudo apt-get install -y libicu-dev
+      - name: Install package
+        run: python -m pip install .
+      - name: Regenerate and validate corpus
+        run: |
+          python tools/generate_compatibility_corpus.py
+          python -m unittest slob tests/test_compatibility_corpus.py
+          git diff --exit-code -- fixtures
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install prebuilt PyICU and the current package
+        run: |
+          python -m pip install pyicu-wheels==2.15.2
+          python -m pip install --no-deps .
+      - name: Validate corpus
+        run: python -m unittest slob tests/test_compatibility_corpus.py

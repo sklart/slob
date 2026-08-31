@@ -5,6 +5,7 @@ import collections
 import encodings
 import functools
 import io
+import json
 import os
 import pickle
 import random
@@ -536,7 +537,7 @@ class Slob(Sequence):
                         self._header.size, self._f.size
                     )
                 )
-        except FileFormatException:
+        except Exception:
             self._f.close()
             raise
 
@@ -1918,6 +1919,53 @@ def _cli_info(args):
         print("\n")
 
 
+def verify(path, full=False):
+    """Validate a SLOB container and return a summary without changing it.
+
+    Basic verification validates every reference and its content type. Full
+    verification additionally decompresses and parses every stored bin,
+    including bins that no reference uses.
+    """
+    with open(path) as s:
+        for blob in s:
+            blob.content_type
+        bin_count = len(s._store)
+        if full:
+            for bin_index in range(bin_count):
+                store_item = s._store[bin_index]
+                for item_index in range(len(store_item.content_type_ids)):
+                    s._store.get(bin_index, item_index)
+        return {
+            "valid": True,
+            "path": path,
+            "compression": s.compression,
+            "blob_count": s.blob_count,
+            "ref_count": len(s),
+            "bin_count": bin_count,
+            "full": full,
+        }
+
+
+def _cli_verify(args):
+    try:
+        result = verify(args.path, full=args.full)
+    except Exception as error:
+        if args.json:
+            print(json.dumps({"valid": False, "error": {
+                "type": type(error).__name__, "message": str(error)}}))
+        else:
+            print("INVALID: {}: {}".format(type(error).__name__, error), file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        mode = "full" if args.full else "basic"
+        print("OK: {} ({} verification, {} refs, {} bins)".format(
+            args.path, mode, result["ref_count"], result["bin_count"]
+        ))
+    return 0
+
+
 def _print_title(title):
     print(title)
     print("-" * len(title))
@@ -2201,6 +2249,18 @@ def _arg_parser():
     )
     parser_info.set_defaults(func=_cli_info)
 
+    parser_verify = subparsers.add_parser(
+        "verify", parents=parents, help="Validate SLOB structure and payloads"
+    )
+    parser_verify.add_argument(
+        "--full", action="store_true",
+        help="Read, decompress, and parse every store bin",
+    )
+    parser_verify.add_argument(
+        "--json", action="store_true", help="Print the result as JSON"
+    )
+    parser_verify.set_defaults(func=_cli_verify)
+
     parser_tag = subparsers.add_parser("tag", help="List tags, view or edit tag value")
     parser_tag.add_argument(
         "-n", "--name", default="", help="Name of tag to view or edit"
@@ -2351,7 +2411,9 @@ def main():
     parser = _arg_parser()
     args = parser.parse_args()
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if result:
+            raise SystemExit(result)
     else:
         parser.print_help()
 

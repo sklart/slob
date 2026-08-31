@@ -1,5 +1,8 @@
 {
   "compression": "lzma2",
   "blob_count": 0,
-  "keys": []
+  "refs": [],
+  "keys": [],
+  "content_types": [],
+  "payload_sha256": {}
 }

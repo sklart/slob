@@ -1,7 +1,20 @@
 {
   "compression": "lzma2",
   "blob_count": 1,
+  "refs": [
+    {
+      "key": "large",
+      "id": 0,
+      "fragment": ""
+    }
+  ],
   "keys": [
     "large"
-  ]
+  ],
+  "content_types": [
+    "application/octet-stream"
+  ],
+  "payload_sha256": {
+    "0": "8f990ba0b577b51cf009ea049368c16bbda1b21e1b93be07a824758bb253c39b"
+  }
 }

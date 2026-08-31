@@ -1,8 +1,27 @@
 {
   "compression": "lzma2",
   "blob_count": 2,
+  "refs": [
+    {
+      "key": "same",
+      "id": 0,
+      "fragment": ""
+    },
+    {
+      "key": "same",
+      "id": 1,
+      "fragment": ""
+    }
+  ],
   "keys": [
     "same",
     "same"
-  ]
+  ],
+  "content_types": [
+    "text/plain; charset=utf-8"
+  ],
+  "payload_sha256": {
+    "0": "a7937b64b8caa58f03721bb6bacf5c78cb235febe0e70b1b84cd99541461a08e",
+    "1": "16367aacb67a4a017c8da8ab95682ccb390863780f7114dda0a0e0c55644c7c4"
+  }
 }

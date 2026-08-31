@@ -1,8 +1,26 @@
 {
   "compression": "lzma2",
   "blob_count": 1,
+  "refs": [
+    {
+      "key": "ёж",
+      "id": 0,
+      "fragment": ""
+    },
+    {
+      "key": "世界",
+      "id": 0,
+      "fragment": ""
+    }
+  ],
   "keys": [
     "ёж",
     "世界"
-  ]
+  ],
+  "content_types": [
+    "text/plain; charset=utf-8"
+  ],
+  "payload_sha256": {
+    "0": "d7f2a4655e3f02e372ebb8bb8d8e9e2eaa33517abc7665cf4258c580c7bfa432"
+  }
 }
