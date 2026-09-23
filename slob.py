@@ -1361,6 +1361,14 @@ class TestMerge(unittest.TestCase):
         with self.assertRaises(TagConflict):
             merge(self.output, (self.a, self.b), tag_policy="error")
 
+    def test_error_tag_policy_keeps_unique_tags_from_all_inputs(self):
+        self._write(self.a, [(b"a", ("a",), MIME_TEXT)], tags={"a": "1"})
+        self._write(self.b, [(b"b", ("b",), MIME_TEXT)], tags={"b": "2"})
+        merge(self.output, (self.a, self.b), tag_policy="error")
+        with open(self.output) as merged:
+            self.assertEqual(merged.tags["a"], "1")
+            self.assertEqual(merged.tags["b"], "2")
+
     def test_rejects_encoding_mismatch_and_existing_output(self):
         self._write(self.a, [(b"a", ("a",), MIME_TEXT)], encoding="utf-8")
         self._write(self.b, [(b"b", ("b",), MIME_TEXT)], encoding="latin-1")
@@ -2218,7 +2226,7 @@ def _merge_tags(input_tags, policy):
                         "input {} has conflicting value for tag {!r}".format(index, name)
                     )
                 known.setdefault(name, value)
-        return first
+        return known
     raise ValueError("unknown tag policy: {!r}".format(policy))
 
 
