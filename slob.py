@@ -1,6 +1,5 @@
 # pylint: disable=C0111,C0103,C0302,R0903,R0904,R0914,R0201
 import argparse
-import array
 import collections
 import encodings
 import functools
@@ -150,6 +149,18 @@ class IncorrectFileSize(FileFormatException):
 
 
 class TagNotFound(Exception):
+    pass
+
+
+class MergeError(Exception):
+    """Base class for errors raised before or while merging SLOB files."""
+
+
+class EncodingMismatch(MergeError):
+    pass
+
+
+class TagConflict(MergeError):
     pass
 
 
@@ -636,6 +647,19 @@ def open(file_or_filenames):
 
 def create(*args, **kwargs):
     return Writer(*args, **kwargs)
+
+
+def _blob_to_refs(slob):
+    """Return the refs for every stored item in one SLOB.
+
+    The mapping is deliberately scoped to a single input.  It lets callers
+    re-write a blob once while preserving all of its aliases and fragments,
+    without retaining metadata for other inputs in memory.
+    """
+    mapping = [collections.defaultdict(list) for _ in range(len(slob._store))]
+    for ref in slob._refs:
+        mapping[ref.bin_index][ref.item_index].append(ref)
+    return mapping
 
 
 class BinMemWriter:
@@ -1236,6 +1260,129 @@ class Writer(object):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.finalize()
         return False
+
+
+class TestMerge(unittest.TestCase):
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory(prefix="test-merge-")
+        self.a = os.path.join(self.tmpdir.name, "a.slob")
+        self.b = os.path.join(self.tmpdir.name, "b.slob")
+        self.output = os.path.join(self.tmpdir.name, "merged.slob")
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def _write(self, path, entries, **kwargs):
+        tags = kwargs.pop("tags", {})
+        with create(path, **kwargs) as writer:
+            for name, value in tags.items():
+                writer.tag(name, value)
+            for content, keys, content_type in entries:
+                writer.add(content, *keys, content_type=content_type)
+
+    def test_preserves_aliases_fragments_types_and_duplicate_keys(self):
+        self._write(
+            self.a,
+            [
+                (b"article", ("Article", "Alias", ("Section alias", "section-1")), MIME_HTML),
+                (b"from-a", ("same",), MIME_TEXT),
+            ],
+            compression="zlib",
+        )
+        self._write(
+            self.b,
+            [
+                (b"from-b", ("same",), "image/svg+xml"),
+                (b"other", ("Other",), "text/css"),
+            ],
+            compression="lzma2",
+        )
+        result = merge(self.output, (self.a, self.b), compression="lzma2", verify_output="full")
+        self.assertEqual(result["output_blobs"], 4)
+        self.assertEqual(result["output_refs"], 6)
+        self.assertTrue(result["verified"])
+        with open(self.output) as merged:
+            dictionary = merged.as_dict(strength=IDENTICAL)
+            article = next(dictionary["Article"])
+            alias = next(dictionary["Alias"])
+            section = next(dictionary["Section alias"])
+            self.assertEqual(article.id, alias.id)
+            self.assertEqual(article.content, b"article")
+            self.assertEqual(section.fragment, "section-1")
+            self.assertEqual(sorted(blob.content for blob in dictionary["same"]), [b"from-a", b"from-b"])
+            self.assertEqual(set(merged.content_types), {MIME_HTML, MIME_TEXT, "image/svg+xml", "text/css"})
+        self.assertTrue(verify(self.output, full=True)["valid"])
+
+    def test_tag_policies_and_runtime_tags(self):
+        self._write(self.a, [(b"a", ("a",), MIME_TEXT)], tags={"label": "first", "shared": "yes"})
+        self._write(self.b, [(b"b", ("b",), MIME_TEXT)], tags={"label": "second", "shared": "yes", "other": "x"})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            merge(self.output, (self.a, self.b), tag_policy="first")
+        self.assertTrue(caught)
+        with open(self.output) as merged:
+            self.assertEqual(merged.tags["label"], "first")
+            self.assertEqual(merged.tags["merged.sources"], "2")
+            self.assertIn("created.at", merged.tags)
+        os.remove(self.output)
+        merge(self.output, (self.a, self.b), tag_policy="common")
+        with open(self.output) as merged:
+            self.assertEqual(merged.tags["shared"], "yes")
+            self.assertNotIn("label", merged.tags)
+            self.assertNotIn("other", merged.tags)
+        os.remove(self.output)
+        with self.assertRaises(TagConflict):
+            merge(self.output, (self.a, self.b), tag_policy="error")
+
+    def test_rejects_encoding_mismatch_and_existing_output(self):
+        self._write(self.a, [(b"a", ("a",), MIME_TEXT)], encoding="utf-8")
+        self._write(self.b, [(b"b", ("b",), MIME_TEXT)], encoding="latin-1")
+        with self.assertRaises(EncodingMismatch):
+            merge(self.output, (self.a, self.b))
+        self.assertFalse(os.path.exists(self.output))
+        self._write(self.output, [(b"old", ("old",), MIME_TEXT)])
+        with self.assertRaises(MergeError):
+            merge(self.output, (self.a,))
+        with open(self.output) as existing:
+            self.assertEqual(next(existing.as_dict()["old"]).content, b"old")
+
+    def test_broken_input_leaves_no_output_or_temp_file(self):
+        broken = os.path.join(self.tmpdir.name, "broken.slob")
+        with fopen(broken, "wb") as stream:
+            stream.write(b"not a slob")
+        with self.assertRaises(Exception):
+            merge(self.output, (broken,))
+        self.assertFalse(os.path.exists(self.output))
+        self.assertEqual([], [name for name in os.listdir(self.tmpdir.name) if ".merge-tmp-" in name])
+
+    def test_failed_verification_keeps_existing_output_intact(self):
+        self._write(self.a, [(b"new", ("new",), MIME_TEXT)])
+        self._write(self.output, [(b"old", ("old",), MIME_TEXT)])
+        original_verify = globals()["verify"]
+
+        def fail_verify(*_args, **_kwargs):
+            raise FileFormatException("intentional verification failure")
+
+        globals()["verify"] = fail_verify
+        try:
+            with self.assertRaises(FileFormatException):
+                merge(os.path.join(self.tmpdir.name, "replacement.slob"), (self.a,))
+        finally:
+            globals()["verify"] = original_verify
+        replacement = os.path.join(self.tmpdir.name, "replacement.slob")
+        self.assertFalse(os.path.exists(replacement))
+        self.assertEqual([], [name for name in os.listdir(self.tmpdir.name) if ".merge-tmp-" in name])
+        with open(self.output) as existing:
+            self.assertEqual(next(existing.as_dict()["old"]).content, b"old")
+
+    def test_cli_merge(self):
+        self._write(self.a, [(b"a", ("a",), MIME_TEXT)])
+        self._write(self.b, [(b"b", ("b",), MIME_TEXT)])
+        parser = _arg_parser()
+        args = parser.parse_args(["merge", "--verify", "full", self.output, self.a, self.b])
+        self.assertEqual(_cli_merge(args), 0)
+        self.assertEqual(verify(self.output, full=True)["ref_count"], 2)
 
 
 class TestReadWrite(unittest.TestCase):
@@ -1919,6 +2066,178 @@ def _cli_info(args):
         print("\n")
 
 
+_RUNTIME_TAGS = frozenset(("created.at", "version.python", "version.pyicu", "version.icu"))
+
+
+def _user_tags(tags):
+    return {name: value for name, value in tags.items() if name not in _RUNTIME_TAGS}
+
+
+def _merge_tags(input_tags, policy):
+    """Choose user tags without replacing Writer's runtime tags."""
+    first = _user_tags(input_tags[0])
+    if policy == "first":
+        for index, tags in enumerate(input_tags[1:], 2):
+            for name, value in _user_tags(tags).items():
+                if name in first and first[name] != value:
+                    warnings.warn(
+                        "input {} has conflicting value for tag {!r}; using first input value".format(index, name),
+                        RuntimeWarning,
+                    )
+        return first
+    if policy == "common":
+        return {
+            name: value
+            for name, value in first.items()
+            if all(_user_tags(tags).get(name) == value for tags in input_tags[1:])
+        }
+    if policy == "error":
+        known = dict(first)
+        for index, tags in enumerate(input_tags[1:], 2):
+            for name, value in _user_tags(tags).items():
+                if name in known and known[name] != value:
+                    raise TagConflict(
+                        "input {} has conflicting value for tag {!r}".format(index, name)
+                    )
+                known.setdefault(name, value)
+        return first
+    raise ValueError("unknown tag policy: {!r}".format(policy))
+
+
+def _merge_temp_path(output_path):
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    output_base = os.path.basename(output_path)
+    fd, path = tempfile.mkstemp(prefix=output_base + ".merge-tmp-", suffix=".slob", dir=output_dir)
+    os.close(fd)
+    os.unlink(path)
+    return path
+
+
+def merge(
+    output_path,
+    input_paths,
+    *,
+    compression=None,
+    min_bin_size=None,
+    workdir=None,
+    tag_policy="first",
+    verify_output=True,
+    progress=None,
+):
+    """Merge SLOB inputs by re-writing each referenced source blob once.
+
+    Blob aliases, fragments and content types are retained.  This does not
+    hash-deduplicate content belonging to separate inputs.
+    """
+    input_paths = list(input_paths)
+    if not input_paths:
+        raise MergeError("at least one input SLOB is required")
+    if os.path.exists(output_path):
+        raise MergeError("output file already exists: {!r}".format(output_path))
+
+    # Validate metadata before creating any output.  This makes tag-policy and
+    # encoding failures side-effect free and keeps the original output intact.
+    input_tags = []
+    input_refs = 0
+    input_blobs = 0
+    encoding = None
+    first_compression = None
+    for index, path in enumerate(input_paths, 1):
+        with open(path) as source:
+            if encoding is None:
+                encoding = source.encoding
+                first_compression = source.compression
+            elif source.encoding != encoding:
+                raise EncodingMismatch(
+                    "input {} has encoding {!r}; expected {!r}".format(index, source.encoding, encoding)
+                )
+            input_tags.append(source.tags)
+            input_refs += len(source)
+            input_blobs += source.blob_count
+
+    tags = _merge_tags(input_tags, tag_policy)
+    if compression is None:
+        compression = first_compression
+    if compression == "none":
+        compression = ""
+    if min_bin_size is None:
+        min_bin_size = 512 * 1024
+    if progress:
+        progress("Total inputs: {}; refs: {}; blobs: {}".format(len(input_paths), input_refs, input_blobs))
+
+    temp_path = _merge_temp_path(output_path)
+    writer = None
+    try:
+        writer = create(
+            temp_path,
+            workdir=workdir,
+            encoding=encoding,
+            compression=compression,
+            min_bin_size=min_bin_size,
+        )
+        for name, value in tags.items():
+            writer.tag(name, value)
+        writer.tag("merged.sources", str(len(input_paths)))
+
+        for input_index, path in enumerate(input_paths, 1):
+            if progress:
+                progress("Input {}/{}: {}".format(input_index, len(input_paths), path))
+            with open(path) as source:
+                blob_refs = _blob_to_refs(source)
+                processed = 0
+                for bin_index, store_item in enumerate(source._store):
+                    for item_index in range(len(store_item.content_type_ids)):
+                        processed += 1
+                        refs = blob_refs[bin_index].get(item_index, ())
+                        # A Writer cannot represent a content item without a
+                        # ref.  Such orphaned stored blobs are intentionally
+                        # omitted, matching the observable SLOB semantics.
+                        if refs:
+                            content_type, content = source._store.get(bin_index, item_index)
+                            keys = [(ref.key, ref.fragment) for ref in refs]
+                            writer.add(content, *keys, content_type=content_type)
+                        if progress and (processed % 1000 == 0 or processed == source.blob_count):
+                            progress("  processed blobs: {}/{}".format(processed, source.blob_count))
+                del blob_refs
+
+        if progress:
+            progress("Writing/finalizing...")
+        writer.finalize()
+        writer = None
+        verified = False
+        if verify_output:
+            if progress:
+                progress("Verifying...")
+            verify(temp_path, full=verify_output == "full")
+            verified = True
+        os.replace(temp_path, output_path)
+        summary = {
+            "input_count": len(input_paths),
+            "input_refs": input_refs,
+            "input_blobs": input_blobs,
+            "output_refs": None,
+            "output_blobs": None,
+            "output_bytes": os.path.getsize(output_path),
+            "compression": compression,
+            "verified": verified,
+        }
+        with open(output_path) as output:
+            summary["output_refs"] = len(output)
+            summary["output_blobs"] = output.blob_count
+        if progress:
+            progress("Done: {:.2f} MiB".format(summary["output_bytes"] / (1024 * 1024)))
+        return summary
+    except Exception:
+        if writer is not None:
+            # finalize() is intentionally not called on failure: a partial
+            # merge must never look like a valid output.
+            writer.tmpdir.cleanup()
+        raise
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def verify(path, full=False):
     """Validate a SLOB container and return a summary without changing it.
 
@@ -2102,16 +2421,12 @@ def _cli_convert(args):
         split = 1024 * 1024 * args.split
 
         print("Mapping blobs to keys...")
-        blob_to_refs = [
-            collections.defaultdict(lambda: array.array("L"))
-            for i in range(len(s._store))
-        ]
+        blob_to_refs = _blob_to_refs(s)
         key_count = 0
         pp = functools.partial(_p, step=10000, fmt=" {:.2f}%/{:.2f}s\n")
         total_keys = len(s)
         blob_count = s.blob_count
-        for i, ref in enumerate(s._refs):
-            blob_to_refs[ref.bin_index][ref.item_index].append(i)
+        for i, _ref in enumerate(s._refs):
             key_count += 1
             pp(i, 100 * key_count / total_keys, time.time() - t0)
 
@@ -2167,8 +2482,7 @@ def _cli_convert(args):
                     time.time() - t1,
                 )
                 keys = []
-                for k in blob_to_refs[bin_index][item_index]:
-                    ref = s._refs[k]
+                for ref in blob_to_refs[bin_index][item_index]:
                     keys.append((ref.key, ref.fragment))
                 if w is None:
                     volume_count += 1
@@ -2194,6 +2508,31 @@ def _cli_convert(args):
             fin(t1, w, current_output)
 
     print("\nDone in {0:.2f}s".format(time.time() - t0))
+
+
+def _cli_merge(args):
+    compression = "" if args.compression == "none" else args.compression
+    verify_mode = False if args.verify == "none" else args.verify
+    try:
+        result = merge(
+            args.output,
+            args.inputs,
+            compression=compression,
+            min_bin_size=args.min_bin_size,
+            workdir=args.workdir,
+            tag_policy=args.tag_policy,
+            verify_output=verify_mode,
+            progress=print,
+        )
+    except Exception as error:
+        print("MERGE FAILED: {}: {}".format(type(error).__name__, error), file=sys.stderr)
+        return 1
+    print(
+        "Merged {input_count} inputs: {output_refs} refs, {output_blobs} blobs, {output_bytes} bytes".format(
+            **result
+        )
+    )
+    return 0
 
 
 def _arg_parser():
@@ -2326,6 +2665,33 @@ def _arg_parser():
     )
 
     parser_convert.set_defaults(func=_cli_convert)
+
+    parser_merge = subparsers.add_parser(
+        "merge",
+        help="Repack multiple SLOB files into one SLOB while preserving aliases",
+    )
+    parser_merge.add_argument("output", help="Path for the new merged SLOB")
+    parser_merge.add_argument("inputs", nargs="+", help="Input SLOB paths, in order")
+    parser_merge.add_argument(
+        "-c", "--compression", choices=("lzma2", "zlib", "none"),
+        help="Compression for the output (default: compression of first input)",
+    )
+    parser_merge.add_argument(
+        "--min-bin-size", type=int, default=512 * 1024,
+        help="Minimum uncompressed bin size in bytes (default: %(default)s)",
+    )
+    parser_merge.add_argument(
+        "--workdir", help="Directory for Writer temporary files",
+    )
+    parser_merge.add_argument(
+        "--tag-policy", choices=("first", "common", "error"), default="first",
+        help="How to retain conflicting user tags (default: %(default)s)",
+    )
+    parser_merge.add_argument(
+        "--verify", choices=("basic", "full", "none"), default="basic",
+        help="Verification before publishing output (default: %(default)s)",
+    )
+    parser_merge.set_defaults(func=_cli_merge)
 
     return parser
 

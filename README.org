@@ -140,6 +140,25 @@
    shared resources such as stylesheets, fonts, javascript or
    images.
 
+** Merge SLOB volumes
+
+   =slob merge= repacks several ordinary SLOB files into one compatible
+   SLOB.  It is not a binary concatenation: every referenced blob is read and
+   written again using the selected output compression.  Keys, aliases,
+   fragments and content types are preserved; duplicate keys from different
+   inputs are also preserved.  Content is not deduplicated across inputs.
+
+   #+BEGIN_SRC sh
+   slob merge --compression lzma2 --verify full ruwiki-merged.slob \
+     ruwiki-0000001-0010000.slob ruwiki-0010001-0020000.slob
+   #+END_SRC
+
+   The merge is atomic: it writes a temporary sibling of the destination and
+   replaces the destination only after finalization and verification.  An
+   existing output is never overwritten.  Input encodings must match.  User
+   tags are taken from the first input by default; use =--tag-policy common=
+   or =--tag-policy error= to choose a stricter policy.
+
 
 ** Examples
 
