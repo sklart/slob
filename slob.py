@@ -1449,6 +1449,19 @@ class TestMerge(unittest.TestCase):
                 merge(self.output, (self.a, self.b))
         self.assertFalse(os.path.exists(self.output))
 
+    def test_preflight_ignores_orphan_only_content_type(self):
+        with create(self.a, max_redirects=0) as writer:
+            for i in range(254):
+                writer.add(b"x", "key-{}".format(i), content_type="application/x-{}".format(i))
+            writer.content_types["application/x-orphan"] = 254
+            writer.current_bin.add(254, b"orphan")
+            writer.blob_count += 1
+        self._write(self.b, [(b"y", ("other",), "application/x-other")], max_redirects=0)
+        result = merge(self.output, (self.a, self.b))
+        self.assertEqual(result["skipped_orphan_blobs"], 1)
+        with open(self.output) as merged:
+            self.assertEqual(len(merged.content_types), 255)
+
     def test_preflight_rejects_too_many_tags(self):
         tags = {"tag-{}".format(i): "value" for i in range(251)}
         self._write(self.a, [(b"x", ("key",), MIME_TEXT)], tags=tags, max_redirects=0)
@@ -2269,9 +2282,22 @@ def merge(
             tag_count, MAX_TINY_TEXT_LEN
         ))
     if len(content_types) > MAX_TINY_TEXT_LEN:
-        raise MergeError("merged SLOB would have {} content types; maximum is {}".format(
-            len(content_types), MAX_TINY_TEXT_LEN
-        ))
+        # Header tables can include a type used only by orphaned store items.
+        # Inspect ref targets only in this rare case so preflight rejects
+        # precisely the types that Writer would have to emit.
+        used_types = set()
+        for path in input_paths:
+            with open(path) as source:
+                blob_refs = _blob_to_refs(source)
+                for bin_index, store_item in enumerate(source._store):
+                    for item_index in blob_refs[bin_index]:
+                        type_id = store_item.content_type_ids[item_index]
+                        used_types.add(source.content_types[type_id])
+                del blob_refs
+            if len(used_types) > MAX_TINY_TEXT_LEN:
+                raise MergeError("merged SLOB would have {} content types; maximum is {}".format(
+                    len(used_types), MAX_TINY_TEXT_LEN
+                ))
     if compression is None:
         compression = first_compression
     if compression == "none":
