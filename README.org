@@ -68,17 +68,18 @@
    and modify slob content.
 
    #+BEGIN_SRC
-   usage: slob [-h] {find,get,info,tag} ...
+   usage: slob [-h] {find,aliases,get,info,verify,tag,convert,merge} ...
 
    positional arguments:
-     {find,get,info,tag}  sub-command
+     {find,aliases,get,info,verify,tag,convert,merge}
        find               Find keys
+       aliases            Find blob aliases
        get                Retrieve blob content
        info               Inspect slob and print basic information about it
+       verify             Validate SLOB structure and payloads
        tag                List tags, view or edit tag value
-       convert            Create new slob with the same convent but different
-                          encoding and compression parameters
-                          or split into multiple slobs
+       convert            Re-encode, re-compress or split a SLOB
+       merge              Repack multiple SLOB files into one SLOB
 
    optional arguments:
      -h, --help           show this help message and exit
@@ -87,6 +88,17 @@
    To see basic slob info such as text encoding, compression and tags:
    #+BEGIN_SRC
    slob info my.slob
+   #+END_SRC
+
+   To validate the structure or read every stored blob:
+   #+BEGIN_SRC sh
+   slob verify my.slob
+   slob verify --full my.slob
+   #+END_SRC
+
+   To combine volumes (see the merge section below for details):
+   #+BEGIN_SRC sh
+   slob merge combined.slob volume-01.slob volume-02.slob
    #+END_SRC
 
    To see value of a tag, for example /label/:

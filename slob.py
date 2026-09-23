@@ -13,6 +13,7 @@ import tempfile
 import unicodedata
 import unittest
 import warnings
+from unittest.mock import patch
 
 from abc import abstractmethod
 from bisect import bisect_left
@@ -1209,6 +1210,29 @@ class Writer(object):
         self.tmpdir.cleanup()
         self._fire_event("end_finalize")
 
+    def abort(self):
+        """Close temporary files before removing the Writer workspace."""
+        errors = []
+        for name in ("f_ref_positions", "f_store_positions", "f_refs", "f_store"):
+            stream = getattr(self, name, None)
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception as error:
+                    errors.append(error)
+        aliases = getattr(self, "f_aliases", None)
+        if aliases is not None:
+            try:
+                aliases.abort()
+            except Exception as error:
+                errors.append(error)
+        try:
+            self.tmpdir.cleanup()
+        except Exception as error:
+            errors.append(error)
+        if errors:
+            raise errors[0]
+
     def size_header(self):
         size = 0
         size += len(MAGIC)
@@ -1298,9 +1322,11 @@ class TestMerge(unittest.TestCase):
             ],
             compression="lzma2",
         )
-        result = merge(self.output, (self.a, self.b), compression="lzma2", verify_output="full")
+        with patch.object(Writer, "_resolve_aliases", side_effect=AssertionError("aliases re-resolved")):
+            result = merge(self.output, (self.a, self.b), compression="lzma2", verify_output="full")
         self.assertEqual(result["output_blobs"], 4)
         self.assertEqual(result["output_refs"], 6)
+        self.assertEqual(result["skipped_orphan_blobs"], 0)
         self.assertTrue(result["verified"])
         with open(self.output) as merged:
             dictionary = merged.as_dict(strength=IDENTICAL)
@@ -1375,6 +1401,85 @@ class TestMerge(unittest.TestCase):
         self.assertEqual([], [name for name in os.listdir(self.tmpdir.name) if ".merge-tmp-" in name])
         with open(self.output) as existing:
             self.assertEqual(next(existing.as_dict()["old"]).content, b"old")
+
+    def test_read_failure_after_first_blob_aborts_writer(self):
+        self._write(self.a, [
+            (b"first", ("first",), MIME_TEXT),
+            (b"second", ("second",), MIME_TEXT),
+        ])
+        workdir = os.path.join(self.tmpdir.name, "work")
+        os.mkdir(workdir)
+        original_get = Store.get
+        original_add = Writer.add
+        original_abort = Writer.abort
+        failure = OSError("second blob read failed")
+        added = []
+
+        def fail_second_read(store, bin_index, item_index):
+            if added:
+                raise failure
+            return original_get(store, bin_index, item_index)
+
+        def record_add(writer, *args, **kwargs):
+            result = original_add(writer, *args, **kwargs)
+            added.append(args[0])
+            return result
+
+        def fail_after_cleanup(writer):
+            original_abort(writer)
+            raise RuntimeError("cleanup reporting failed")
+
+        with patch.object(Store, "get", fail_second_read), patch.object(Writer, "add", record_add), patch.object(Writer, "abort", fail_after_cleanup):
+            with self.assertRaises(OSError) as caught:
+                merge(self.output, (self.a,), workdir=workdir)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(added, [b"first"])
+        self.assertFalse(os.path.exists(self.output))
+        self.assertFalse(any(".merge-tmp-" in name for name in os.listdir(self.tmpdir.name)))
+        self.assertEqual(os.listdir(workdir), [])
+
+    def test_preflight_rejects_too_many_content_types(self):
+        for path, start, count in ((self.a, 0, 130), (self.b, 130, 126)):
+            self._write(path, [
+                (b"x", ("key-{}".format(i),), "application/x-{}".format(i))
+                for i in range(start, start + count)
+            ], max_redirects=0)
+        with patch(__name__ + "._merge_temp_path", side_effect=AssertionError("output creation started")):
+            with self.assertRaisesRegex(MergeError, "256 content types; maximum is 255"):
+                merge(self.output, (self.a, self.b))
+        self.assertFalse(os.path.exists(self.output))
+
+    def test_preflight_rejects_too_many_tags(self):
+        tags = {"tag-{}".format(i): "value" for i in range(251)}
+        self._write(self.a, [(b"x", ("key",), MIME_TEXT)], tags=tags, max_redirects=0)
+        with patch(__name__ + "._merge_temp_path", side_effect=AssertionError("output creation started")):
+            with self.assertRaisesRegex(MergeError, "256 tags; maximum is 255"):
+                merge(self.output, (self.a,))
+        self.assertFalse(os.path.exists(self.output))
+
+    def test_orphan_blob_is_counted_and_skipped(self):
+        with create(self.a, max_redirects=0) as writer:
+            writer.add(b"referenced", "key", content_type=MIME_TEXT)
+            writer.current_bin.add(writer.content_types[MIME_TEXT], b"orphan")
+            writer.blob_count += 1
+        result = merge(self.output, (self.a,), verify_output="full")
+        self.assertEqual(result["input_blobs"], 2)
+        self.assertEqual(result["skipped_orphan_blobs"], 1)
+        self.assertEqual(result["output_blobs"], 1)
+
+    def test_convert_preserves_resolved_aliases_without_reresolving(self):
+        with create(self.a) as writer:
+            writer.add(b"article", "Article", ("Section", "part"), content_type=MIME_HTML)
+            writer.add_alias("Alias", "Article")
+        args = _arg_parser().parse_args(["convert", self.a, self.output])
+        with patch.object(Writer, "_resolve_aliases", side_effect=AssertionError("aliases re-resolved")):
+            _cli_convert(args)
+        with open(self.output) as converted:
+            keys = {ref.key: ref for ref in converted}
+            self.assertEqual(set(keys), {"Article", "Section", "Alias"})
+            self.assertEqual({ref.id for ref in keys.values()}, {keys["Article"].id})
+            self.assertEqual(keys["Section"].fragment, "part")
+            self.assertEqual(keys["Alias"].content, b"article")
 
     def test_cli_merge(self):
         self._write(self.a, [(b"a", ("a",), MIME_TEXT)])
@@ -2140,6 +2245,7 @@ def merge(
     input_tags = []
     input_refs = 0
     input_blobs = 0
+    content_types = set()
     encoding = None
     first_compression = None
     for index, path in enumerate(input_paths, 1):
@@ -2152,10 +2258,20 @@ def merge(
                     "input {} has encoding {!r}; expected {!r}".format(index, source.encoding, encoding)
                 )
             input_tags.append(source.tags)
+            content_types.update(source.content_types)
             input_refs += len(source)
             input_blobs += source.blob_count
 
     tags = _merge_tags(input_tags, tag_policy)
+    tag_count = len(set(tags) | _RUNTIME_TAGS | {"merged.sources"})
+    if tag_count > MAX_TINY_TEXT_LEN:
+        raise MergeError("merged SLOB would have {} tags; maximum is {}".format(
+            tag_count, MAX_TINY_TEXT_LEN
+        ))
+    if len(content_types) > MAX_TINY_TEXT_LEN:
+        raise MergeError("merged SLOB would have {} content types; maximum is {}".format(
+            len(content_types), MAX_TINY_TEXT_LEN
+        ))
     if compression is None:
         compression = first_compression
     if compression == "none":
@@ -2167,6 +2283,7 @@ def merge(
 
     temp_path = _merge_temp_path(output_path)
     writer = None
+    skipped_orphan_blobs = 0
     try:
         writer = create(
             temp_path,
@@ -2174,6 +2291,7 @@ def merge(
             encoding=encoding,
             compression=compression,
             min_bin_size=min_bin_size,
+            max_redirects=0,
         )
         for name, value in tags.items():
             writer.tag(name, value)
@@ -2196,6 +2314,8 @@ def merge(
                             content_type, content = source._store.get(bin_index, item_index)
                             keys = [(ref.key, ref.fragment) for ref in refs]
                             writer.add(content, *keys, content_type=content_type)
+                        else:
+                            skipped_orphan_blobs += 1
                         if progress and (processed % 1000 == 0 or processed == source.blob_count):
                             progress("  processed blobs: {}/{}".format(processed, source.blob_count))
                 del blob_refs
@@ -2215,6 +2335,7 @@ def merge(
             "input_count": len(input_paths),
             "input_refs": input_refs,
             "input_blobs": input_blobs,
+            "skipped_orphan_blobs": skipped_orphan_blobs,
             "output_refs": None,
             "output_blobs": None,
             "output_bytes": os.path.getsize(output_path),
@@ -2227,15 +2348,21 @@ def merge(
         if progress:
             progress("Done: {:.2f} MiB".format(summary["output_bytes"] / (1024 * 1024)))
         return summary
-    except Exception:
+    except BaseException:
         if writer is not None:
-            # finalize() is intentionally not called on failure: a partial
-            # merge must never look like a valid output.
-            writer.tmpdir.cleanup()
-        raise
-    finally:
-        if os.path.exists(temp_path):
+            try:
+                writer.abort()
+            except Exception:
+                # Preserve the failure that interrupted the merge.
+                pass
+        try:
             os.remove(temp_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Preserve the failure that interrupted the merge.
+            pass
+        raise
 
 
 def verify(path, full=False):
@@ -2447,6 +2574,7 @@ def _cli_convert(args):
                 encoding=encoding,
                 compression=compression,
                 min_bin_size=min_bin_size,
+                max_redirects=0,
             )
             for name, value in s.tags.items():
                 if not name in w.tags:
