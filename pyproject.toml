@@ -20,3 +20,8 @@ slob = "slob:main"
 
 [tool.setuptools]
 py-modules = ["slob"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.16.9",
+]
