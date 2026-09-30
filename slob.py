@@ -19,7 +19,7 @@ from abc import abstractmethod
 from bisect import bisect_left
 from builtins import open as fopen
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from functools import lru_cache
 from struct import pack, unpack, calcsize
@@ -83,14 +83,17 @@ def init_compressions():
         try:
             m = __import__(name)
         except ImportError:
-            warnings.warn("%s is not available" % name)
+            warnings.warn("%s is not available" % name, stacklevel=2)
         else:
-            compressions[name] = Compression(lambda x: m.compress(x, 9), m.decompress)
+            compressions[name] = Compression(
+                lambda x, module=m: module.compress(x, 9),
+                m.decompress,
+            )
 
     try:
         import lzma
     except ImportError:
-        warnings.warn("lzma is not available")
+        warnings.warn("lzma is not available", stacklevel=2)
     else:
         filters = [{"id": lzma.FILTER_LZMA2}]
         compress = lambda s: lzma.compress(s, format=lzma.FORMAT_RAW, filters=filters)
@@ -681,7 +684,7 @@ class BinMemWriter:
     def __len__(self):
         return len(self.item_dir)
 
-    def finalize(self, fout: "output file", compress: "function"):
+    def finalize(self, fout: StructWriter, compress: Callable[[bytes], bytes]):
         count = len(self)
         fout.write(pack(U_INT, count))
         for content_type_id in self.content_type_ids:
@@ -1385,7 +1388,7 @@ class TestMerge(unittest.TestCase):
         broken = os.path.join(self.tmpdir.name, "broken.slob")
         with fopen(broken, "wb") as stream:
             stream.write(b"not a slob")
-        with self.assertRaises(Exception):
+        with self.assertRaises(FileFormatException):
             merge(self.output, (broken,))
         self.assertFalse(os.path.exists(self.output))
         self.assertEqual([], [name for name in os.listdir(self.tmpdir.name) if ".merge-tmp-" in name])
@@ -2209,6 +2212,7 @@ def _merge_tags(input_tags, policy):
                     warnings.warn(
                         "input {} has conflicting value for tag {!r}; using first input value".format(index, name),
                         RuntimeWarning,
+                        stacklevel=2,
                     )
         return first
     if policy == "common":
@@ -2408,7 +2412,7 @@ def verify(path, full=False):
     """
     with open(path) as s:
         for blob in s:
-            blob.content_type
+            _ = blob.content_type
         bin_count = len(s._store)
         if full:
             for bin_index in range(bin_count):
@@ -2477,7 +2481,7 @@ def _print_tags(s, tag_name=None):
 
 def _print_dict(d):
     max_key_len = 0
-    for k, v in d.items():
+    for k in d:
         key_len = len(k)
         if key_len > max_key_len:
             max_key_len = key_len
@@ -2545,7 +2549,6 @@ def _p(i, *args, step=100, steps_per_line=50, fmt="{}"):
 
 
 def _cli_convert(args):
-    import sys
     import time
 
     t0 = time.time()

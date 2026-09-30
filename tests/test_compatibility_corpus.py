@@ -49,11 +49,11 @@ class CompatibilityCorpusTest(unittest.TestCase):
         }
         for name, error_name in expected.items():
             with self.subTest(fixture=name):
-                with self.assertRaises(Exception) as context:
+                with self.assertRaises(slob.FileFormatException) as context:
                     with slob.open(str(ROOT / "corrupted" / name)) as reader:
                         for blob in reader:
-                            blob.content_type
-                            blob.content
+                            _ = blob.content_type
+                            _ = blob.content
                 self.assertEqual(error_name, type(context.exception).__name__)
 
     def test_verify_and_info_cli(self):
